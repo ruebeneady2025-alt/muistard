@@ -8,6 +8,7 @@ import org.spongepowered.asm.mixin.injection.Inject;
 import org.spongepowered.asm.mixin.injection.callback.CallbackInfo;
 
 import com.mustard.addon.modules.SusChunkFinder;
+import meteordevelopment.meteorclient.systems.modules.Modules;
 
 /**
  * Intercepts chunk unload events
@@ -21,7 +22,10 @@ public class ClientChunkManagerMixin {
         at = @At("HEAD")
     )
     private void onChunkUnload(int x, int z, CallbackInfo ci) {
+        SusChunkFinder module = Modules.get().get(SusChunkFinder.class);
+        if (module == null || !module.isActive()) return;
+
         ChunkPos chunkPos = new ChunkPos(x, z);
-        SusChunkFinder.getInstance().onChunkUnload(chunkPos);
+        module.onChunkUnload(chunkPos);
     }
 }

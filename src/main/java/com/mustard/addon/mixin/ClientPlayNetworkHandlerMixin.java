@@ -1,15 +1,17 @@
 package com.mustard.addon.mixin;
 
+import net.minecraft.client.MinecraftClient;
 import net.minecraft.client.network.ClientPlayNetworkHandler;
 import net.minecraft.network.packet.s2c.play.ChunkDataS2CPacket;
+import net.minecraft.util.math.ChunkPos;
+import net.minecraft.world.chunk.WorldChunk;
 import org.spongepowered.asm.mixin.Mixin;
 import org.spongepowered.asm.mixin.injection.At;
 import org.spongepowered.asm.mixin.injection.Inject;
 import org.spongepowered.asm.mixin.injection.callback.CallbackInfo;
 
 import com.mustard.addon.modules.SusChunkFinder;
-import net.minecraft.world.chunk.WorldChunk;
-import net.minecraft.util.math.ChunkPos;
+import meteordevelopment.meteorclient.systems.modules.Modules;
 
 /**
  * Intercepts chunk data packets to trigger instant detection
@@ -27,15 +29,17 @@ public class ClientPlayNetworkHandlerMixin {
         at = @At("TAIL")
     )
     private void onChunkDataLoaded(ChunkDataS2CPacket packet, CallbackInfo ci) {
-        // Get the chunk from the client world
-        if (net.minecraft.client.MinecraftClient.getInstance().world != null) {
-            ChunkPos chunkPos = packet.getChunkPos();
-            WorldChunk chunk = net.minecraft.client.MinecraftClient.getInstance()
-                .world.getChunk(chunkPos.x, chunkPos.z);
-            
-            if (chunk != null) {
-                SusChunkFinder.getInstance().onChunkLoad(chunk);
-            }
+        MinecraftClient mc = MinecraftClient.getInstance();
+        if (mc.world == null) return;
+
+        SusChunkFinder module = Modules.get().get(SusChunkFinder.class);
+        if (module == null || !module.isActive()) return;
+
+        ChunkPos chunkPos = packet.getChunkPos();
+        WorldChunk chunk = mc.world.getChunk(chunkPos.x, chunkPos.z);
+        
+        if (chunk != null) {
+            module.onChunkLoad(chunk);
         }
     }
 }

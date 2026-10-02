@@ -1,10 +1,19 @@
 package com.mustard.addon.modules;
 
+import meteordevelopment.meteorclient.events.render.Render3DEvent;
+import meteordevelopment.meteorclient.events.world.TickEvent;
+import meteordevelopment.meteorclient.settings.*;
+import meteordevelopment.meteorclient.systems.modules.Categories;
+import meteordevelopment.meteorclient.systems.modules.Module;
+import meteordevelopment.meteorclient.utils.render.color.Color;
+import meteordevelopment.orbit.EventHandler;
 import net.minecraft.client.MinecraftClient;
 import net.minecraft.client.world.ClientWorld;
 import net.minecraft.util.math.ChunkPos;
 import net.minecraft.util.math.Vec3d;
+import net.minecraft.world.biome.Biome;
 import net.minecraft.world.chunk.WorldChunk;
+
 import java.util.*;
 
 /**
@@ -13,134 +22,221 @@ import java.util.*;
  * NO ACTIVE SCANNING - Only processes chunks on packet load
  * NO ENTITY/TILE ENTITY DETECTION - Block-based detection only
  */
-public class SusChunkFinder {
-    private static final SusChunkFinder INSTANCE = new SusChunkFinder();
-    
-    // Core detection flags
-    private boolean enabled = true;
-    private Set<ChunkPos> suspiciousChunks = Collections.synchronizedSet(new HashSet<>());
-    private Map<ChunkPos, List<String>> chunkReasons = Collections.synchronizedMap(new HashMap<>());
-    
+public class SusChunkFinder extends Module {
+    private final MinecraftClient mc = MinecraftClient.getInstance();
+
+    private final SettingGroup sgGeneral = settings.getDefaultGroup();
+    private final SettingGroup sgPacket = settings.createGroup("Packet & Cache");
+    private final SettingGroup sgVisuals = settings.createGroup("Visuals");
+
     // Detection toggles
-    private boolean detectAmethyst = true;
-    private boolean detectKelp = true;
-    private boolean detectBamboo = true;
-    private boolean detectVines = true;
-    private boolean detectGrowthBlocks = true;
-    private boolean detectStructuralBlocks = true;
-    
-    // Cache & packet configuration
-    private boolean clearCacheOnRelog = true;
-    private boolean processUnloadEvents = true;
-    
-    // Visual configuration
-    private HighlightStyle highlightStyle = HighlightStyle.OUTLINE;
-    private int susChunkColor = 0xFF0033; // Bright Neon Red
-    private float colorAlpha = 0.7f;
-    private boolean showDistanceIndicator = true;
-    
-    // Rendering cache
-    private Vec3d lastPlayerPos = Vec3d.ZERO;
+    private final Setting<Boolean> amethystClusters = sgGeneral.add(new BoolSetting.Builder()
+        .name("amethyst-clusters")
+        .description("Detect amethyst clusters outside of natural geode conditions.")
+        .defaultValue(true)
+        .build());
+
+    private final Setting<Boolean> kelp = sgGeneral.add(new BoolSetting.Builder()
+        .name("kelp")
+        .description("Detect kelp planted in non-ocean biomes or at unnatural Y-levels.")
+        .defaultValue(true)
+        .build());
+
+    private final Setting<Boolean> bamboo = sgGeneral.add(new BoolSetting.Builder()
+        .name("bamboo")
+        .description("Detect bamboo growing underground or in non-jungle biomes.")
+        .defaultValue(true)
+        .build());
+
+    private final Setting<Boolean> vines = sgGeneral.add(new BoolSetting.Builder()
+        .name("vines-cave-vines")
+        .description("Detect vines/cave vines placed manually outside lush/jungle conditions.")
+        .defaultValue(true)
+        .build());
+
+    private final Setting<Boolean> growthBlocks = sgGeneral.add(new BoolSetting.Builder()
+        .name("growth-block-filter")
+        .description("General toggle for checking unexpected plant growth.")
+        .defaultValue(true)
+        .build());
+
+    private final Setting<Boolean> structuralBlocks = sgGeneral.add(new BoolSetting.Builder()
+        .name("player-placed-structural-blocks")
+        .description("Flags common manually placed builder blocks (obsidian, crafting table, etc).")
+        .defaultValue(true)
+        .build());
+
+    // Packet & Cache
+    private final Setting<Boolean> clearCacheOnRelog = sgPacket.add(new BoolSetting.Builder()
+        .name("clear-cache-on-relog")
+        .description("Clears suspicious chunk cache when disconnecting or changing dimensions.")
+        .defaultValue(true)
+        .build());
+
+    private final Setting<Boolean> processUnloadEvents = sgPacket.add(new BoolSetting.Builder()
+        .name("process-unload-events")
+        .description("Automatically removes chunks from visual list when server unloads them.")
+        .defaultValue(true)
+        .build());
+
+    // Visuals
+    private final Setting<HighlightStyle> highlightStyle = sgVisuals.add(new EnumSetting.Builder<HighlightStyle>()
+        .name("highlight-style")
+        .description("Outline = wireframe, Filled = translucent box.")
+        .defaultValue(HighlightStyle.OUTLINE)
+        .build());
+
+    private final Setting<Color> susChunkColor = sgVisuals.add(new ColorSetting.Builder()
+        .name("sus-chunk-color")
+        .description("Color for suspicious chunk highlights.")
+        .defaultValue(new Color(255, 0, 51, 180))
+        .build());
+
+    private final Setting<Boolean> distanceIndicator = sgVisuals.add(new BoolSetting.Builder()
+        .name("distance-indicator")
+        .description("Render text showing closest suspicious chunk and distance in meters.")
+        .defaultValue(true)
+        .build());
+
+    // Internal state
+    private final Set<ChunkPos> suspiciousChunks = Collections.synchronizedSet(new HashSet<>());
+    private final Map<ChunkPos, List<String>> chunkReasons = Collections.synchronizedMap(new HashMap<>());
+
     private ChunkPos closestSusChunk = null;
     private double closestDistance = Double.MAX_VALUE;
-    
+
     public enum HighlightStyle {
-        OUTLINE("Outline"),
-        FILLED("Filled");
-        
-        public final String displayName;
-        HighlightStyle(String displayName) {
-            this.displayName = displayName;
+        OUTLINE,
+        FILLED
+    }
+
+    public SusChunkFinder() {
+        super(Categories.Render, "sus-chunk-finder", "Detect suspicious chunks via packet-driven block analysis. No active scanning, no tile entity checks.");
+    }
+
+    @Override
+    public void onActivate() {
+        suspiciousChunks.clear();
+        chunkReasons.clear();
+        closestSusChunk = null;
+        closestDistance = Double.MAX_VALUE;
+    }
+
+    @Override
+    public void onDeactivate() {
+        suspiciousChunks.clear();
+        chunkReasons.clear();
+        closestSusChunk = null;
+        closestDistance = Double.MAX_VALUE;
+    }
+
+    @EventHandler
+    private void onTick(TickEvent.Post event) {
+        if (mc.world == null) {
+            if (clearCacheOnRelog.get()) {
+                clearCache();
+            }
         }
+        updateClosestChunk();
     }
-    
-    private SusChunkFinder() {}
-    
-    public static SusChunkFinder getInstance() {
-        return INSTANCE;
+
+    @EventHandler
+    private void onRender3D(Render3DEvent event) {
+        if (mc.player == null || mc.world == null || suspiciousChunks.isEmpty()) return;
+        render(event);
     }
-    
+
     /**
      * Called when a chunk packet is received - INSTANT, NO POLLING
-     * This is the core detection method
      */
     public void onChunkLoad(WorldChunk chunk) {
-        if (!enabled || chunk == null) return;
-        
-        ChunkPos chunkPos = chunk.getPos();
+        if (mc.world == null || chunk == null) return;
+
+        ChunkPos pos = chunk.getPos();
         List<String> reasons = new ArrayList<>();
-        
-        // Single-pass block checking
+
         checkChunkBlocks(chunk, reasons);
-        
+
         if (!reasons.isEmpty()) {
-            suspiciousChunks.add(chunkPos);
-            chunkReasons.put(chunkPos, reasons);
+            suspiciousChunks.add(pos);
+            chunkReasons.put(pos, reasons);
         } else {
-            suspiciousChunks.remove(chunkPos);
-            chunkReasons.remove(chunkPos);
+            suspiciousChunks.remove(pos);
+            chunkReasons.remove(pos);
         }
+
+        updateClosestChunk();
     }
-    
+
+    /**
+     * Called when a chunk unload packet arrives
+     */
+    public void onChunkUnload(ChunkPos pos) {
+        if (!processUnloadEvents.get()) return;
+        suspiciousChunks.remove(pos);
+        chunkReasons.remove(pos);
+        updateClosestChunk();
+    }
+
+    public void clearCache() {
+        suspiciousChunks.clear();
+        chunkReasons.clear();
+        closestSusChunk = null;
+        closestDistance = Double.MAX_VALUE;
+    }
+
     /**
      * Single-pass block state inspection - extremely lightweight
      */
     private void checkChunkBlocks(WorldChunk chunk, List<String> reasons) {
-        ChunkPos chunkPos = chunk.getPos();
-        ClientWorld world = MinecraftClient.getInstance().world;
+        ClientWorld world = mc.world;
         if (world == null) return;
-        
-        int chunkX = chunkPos.getStartX();
-        int chunkZ = chunkPos.getStartZ();
-        
-        // Iterate through all block positions in the chunk
+
+        ChunkPos chunkPos = chunk.getPos();
+        int chunkStartX = chunkPos.getStartX();
+        int chunkStartZ = chunkPos.getStartZ();
+
         for (int x = 0; x < 16; x++) {
             for (int z = 0; z < 16; z++) {
                 for (int y = world.getBottomY(); y < world.getTopY(); y++) {
-                    int worldX = chunkX + x;
-                    int worldZ = chunkZ + z;
-                    
-                    var blockState = chunk.getBlockState(worldX, y, worldZ);
-                    var blockName = blockState.getBlock().getTranslationKey();
-                    
-                    // AMETHYST CLUSTERS
-                    if (detectAmethyst && isAmethystCluster(blockName)) {
-                        if (!isInAmethystGeode(world, worldX, y, worldZ)) {
+                    int wx = chunkStartX + x;
+                    int wz = chunkStartZ + z;
+
+                    var blockState = chunk.getBlockState(wx, y, wz);
+                    String blockName = blockState.getBlock().getTranslationKey();
+
+                    if (amethystClusters.get() && isAmethystCluster(blockName)) {
+                        if (!isInNaturalAmethystGeode(world, wx, y, wz)) {
                             reasons.add("Amethyst @ Y:" + y);
                         }
                     }
-                    
-                    // KELP
-                    if (detectKelp && isKelp(blockName)) {
-                        if (!isOceanBiome(world, worldX, worldZ) || y > 62) {
+
+                    if (kelp.get() && isKelp(blockName)) {
+                        if (!isOceanBiome(world, wx, wz) || y > 62) {
                             reasons.add("Kelp @ Y:" + y);
                         }
                     }
-                    
-                    // BAMBOO
-                    if (detectBamboo && isBamboo(blockName)) {
-                        if (y < 64 || !isJungleBiome(world, worldX, worldZ)) {
+
+                    if (bamboo.get() && isBamboo(blockName)) {
+                        if (y < 64 || !isJungleBiome(world, wx, wz)) {
                             reasons.add("Bamboo @ Y:" + y);
                         }
                     }
-                    
-                    // VINES & CAVE VINES
-                    if (detectVines && (isVine(blockName) || isCaveVine(blockName))) {
-                        if (!isLushCaveOrJungle(world, worldX, y, worldZ)) {
+
+                    if (vines.get() && (isVine(blockName) || isCaveVine(blockName))) {
+                        if (!isLushCaveOrJungle(world, wx, y, wz)) {
                             reasons.add(isVine(blockName) ? "Vine" : "CaveVine");
                         }
                     }
-                    
-                    // GROWTH BLOCKS (Sugar Cane, Cactus, Sweet Berry)
-                    if (detectGrowthBlocks && isGrowthBlock(blockName)) {
-                        if (y < 62 || !isNaturalGrowthLocation(world, worldX, y, worldZ, blockName)) {
+
+                    if (growthBlocks.get() && isGrowthBlock(blockName)) {
+                        if (y < 62 || !isNaturalGrowthLocation(world, wx, y, wz, blockName)) {
                             reasons.add("Growth:" + blockName.replace("block.minecraft.", ""));
                         }
                     }
-                    
-                    // STRUCTURAL BLOCKS (Obsidian, Crafting Table, Ender Chest, etc.)
-                    if (detectStructuralBlocks && isStructuralBlock(blockName)) {
-                        if (!isNaturalStructuralLocation(world, worldX, y, worldZ, blockName)) {
+
+                    if (structuralBlocks.get() && isStructuralBlock(blockName)) {
+                        if (!isNaturalStructuralLocation(world, wx, y, wz, blockName)) {
                             reasons.add("Struct:" + blockName.replace("block.minecraft.", ""));
                         }
                     }
@@ -148,15 +244,14 @@ public class SusChunkFinder {
             }
         }
     }
-    
+
     // ==================== BLOCK DETECTION HELPERS ====================
-    
+
     private boolean isAmethystCluster(String blockName) {
         return blockName.contains("amethyst_cluster");
     }
-    
-    private boolean isInAmethystGeode(ClientWorld world, int x, int y, int z) {
-        // Check if surrounded by amethyst blocks or deep slate
+
+    private boolean isInNaturalAmethystGeode(ClientWorld world, int x, int y, int z) {
         int amethystCount = 0;
         for (int dx = -2; dx <= 2; dx++) {
             for (int dz = -2; dz <= 2; dz++) {
@@ -167,48 +262,48 @@ public class SusChunkFinder {
                 }
             }
         }
-        return amethystCount > 20; // Natural geodes have high amethyst density
+        return amethystCount > 20;
     }
-    
+
     private boolean isKelp(String blockName) {
         return blockName.contains("kelp");
     }
-    
+
     private boolean isOceanBiome(ClientWorld world, int x, int z) {
-        var biome = world.getBiome(x, 0, z);
-        String biomeName = biome.value().getTranslationKey();
+        Biome biome = world.getBiome(x, 64, z);
+        String biomeName = biome.getKey().map(k -> k.getValue().toString()).orElse("");
         return biomeName.contains("ocean") || biomeName.contains("deep_ocean");
     }
-    
+
     private boolean isBamboo(String blockName) {
         return blockName.contains("bamboo");
     }
-    
+
     private boolean isJungleBiome(ClientWorld world, int x, int z) {
-        var biome = world.getBiome(x, 64, z);
-        String biomeName = biome.value().getTranslationKey();
+        Biome biome = world.getBiome(x, 64, z);
+        String biomeName = biome.getKey().map(k -> k.getValue().toString()).orElse("");
         return biomeName.contains("jungle");
     }
-    
+
     private boolean isVine(String blockName) {
         return blockName.contains("vine") && !blockName.contains("cave");
     }
-    
+
     private boolean isCaveVine(String blockName) {
         return blockName.contains("cave_vine") || blockName.contains("glow_berries");
     }
-    
+
     private boolean isLushCaveOrJungle(ClientWorld world, int x, int y, int z) {
-        var biome = world.getBiome(x, y, z);
-        String biomeName = biome.value().getTranslationKey();
+        Biome biome = world.getBiome(x, y, z);
+        String biomeName = biome.getKey().map(k -> k.getValue().toString()).orElse("");
         return biomeName.contains("lush_caves") || biomeName.contains("jungle");
     }
-    
+
     private boolean isGrowthBlock(String blockName) {
         return blockName.contains("sugar_cane") || blockName.contains("cactus") 
             || blockName.contains("sweet_berry_bush");
     }
-    
+
     private boolean isNaturalGrowthLocation(ClientWorld world, int x, int y, int z, String blockName) {
         if (blockName.contains("sugar_cane")) {
             var below = world.getBlockState(x, y - 1, z).getBlock().getTranslationKey();
@@ -218,121 +313,133 @@ public class SusChunkFinder {
             var below = world.getBlockState(x, y - 1, z).getBlock().getTranslationKey();
             return below.contains("sand");
         }
-        if (blockName.contains("sweet_berry")) {
-            return y > 62; // Natural in overworld surface
+        if (blockName.contains("sweet_berry_bush")) {
+            return y > 62;
         }
         return true;
     }
-    
+
     private boolean isStructuralBlock(String blockName) {
         return blockName.contains("obsidian") || blockName.contains("crafting_table")
             || blockName.contains("ender_chest") || blockName.contains("enchanting_table")
             || blockName.contains("netherite_block") || blockName.contains("beacon")
             || blockName.contains("anvil");
     }
-    
+
     private boolean isNaturalStructuralLocation(ClientWorld world, int x, int y, int z, String blockName) {
-        // Obsidian can appear naturally near lava or in nether
         if (blockName.contains("obsidian")) {
-            var biome = world.getBiome(x, y, z).value().getTranslationKey();
-            return biome.contains("nether");
+            Biome biome = world.getBiome(x, y, z);
+            String biomeName = biome.getKey().map(k -> k.getValue().toString()).orElse("");
+            return biomeName.contains("nether");
         }
-        // Crafting table, ender chest, enchanting table, beacon never generate naturally
-        return !blockName.contains("crafting_table") && !blockName.contains("ender_chest")
-            && !blockName.contains("enchanting_table") && !blockName.contains("beacon")
-            && !blockName.contains("anvil") && !blockName.contains("netherite_block");
+        return false;
     }
-    
-    // ==================== CHUNK UNLOAD / CACHE ====================
-    
-    public void onChunkUnload(ChunkPos chunkPos) {
-        if (!processUnloadEvents) return;
-        suspiciousChunks.remove(chunkPos);
-        chunkReasons.remove(chunkPos);
-    }
-    
-    public void clearCache() {
-        suspiciousChunks.clear();
-        chunkReasons.clear();
+
+    private void updateClosestChunk() {
         closestSusChunk = null;
         closestDistance = Double.MAX_VALUE;
-    }
-    
-    // ==================== GETTERS / SETTERS ====================
-    
-    public Set<ChunkPos> getSuspiciousChunks() {
-        return new HashSet<>(suspiciousChunks);
-    }
-    
-    public List<String> getReasonsForChunk(ChunkPos pos) {
-        return chunkReasons.getOrDefault(pos, new ArrayList<>());
-    }
-    
-    public void updatePlayerPosition(Vec3d playerPos) {
-        this.lastPlayerPos = playerPos;
-        
-        // Find closest sus chunk
-        closestSusChunk = null;
-        closestDistance = Double.MAX_VALUE;
-        
-        for (ChunkPos chunkPos : suspiciousChunks) {
-            double chunkCenterX = chunkPos.getCenterX();
-            double chunkCenterZ = chunkPos.getCenterZ();
-            double distance = playerPos.distanceTo(new Vec3d(chunkCenterX, playerPos.y, chunkCenterZ));
-            
+
+        if (mc.player == null) return;
+        Vec3d playerPos = mc.player.getPos();
+
+        for (ChunkPos pos : suspiciousChunks) {
+            double cx = pos.getCenterX();
+            double cz = pos.getCenterZ();
+            double distance = playerPos.distanceTo(new Vec3d(cx, playerPos.y, cz));
+
             if (distance < closestDistance) {
                 closestDistance = distance;
-                closestSusChunk = chunkPos;
+                closestSusChunk = pos;
             }
         }
     }
-    
-    public ChunkPos getClosestSusChunk() {
-        return closestSusChunk;
+
+    private void render(Render3DEvent event) {
+        Vec3d camPos = mc.gameRenderer.getCamera().getPos();
+        Color color = susChunkColor.get();
+
+        for (ChunkPos chunkPos : suspiciousChunks) {
+            int x1 = chunkPos.getStartX();
+            int z1 = chunkPos.getStartZ();
+            int x2 = x1 + 16;
+            int z2 = z1 + 16;
+            int y1 = mc.world.getBottomY();
+            int y2 = mc.world.getTopY();
+
+            if (highlightStyle.get() == HighlightStyle.OUTLINE) {
+                renderOutline(event, x1, z1, x2, z2, y1, y2, camPos, color);
+            } else {
+                renderFilled(event, x1, z1, x2, z2, y1, y2, camPos, color);
+            }
+        }
+
+        if (distanceIndicator.get()) {
+            renderDistanceLabel();
+        }
     }
-    
-    public double getClosestDistance() {
-        return closestDistance;
+
+    private void renderOutline(Render3DEvent event, int x1, int z1, int x2, int z2, int y1, int y2, Vec3d cam, Color color) {
+        double dx1 = x1 - cam.x;
+        double dz1 = z1 - cam.z;
+        double dx2 = x2 - cam.x;
+        double dz2 = z2 - cam.z;
+        double dy1 = y1 - cam.y;
+        double dy2 = y2 - cam.y;
+
+        // Bottom edges
+        event.line(dx1, dy1, dz1, dx2, dy1, dz1, color);
+        event.line(dx2, dy1, dz1, dx2, dy1, dz2, color);
+        event.line(dx2, dy1, dz2, dx1, dy1, dz2, color);
+        event.line(dx1, dy1, dz2, dx1, dy1, dz1, color);
+
+        // Top edges
+        event.line(dx1, dy2, dz1, dx2, dy2, dz1, color);
+        event.line(dx2, dy2, dz1, dx2, dy2, dz2, color);
+        event.line(dx2, dy2, dz2, dx1, dy2, dz2, color);
+        event.line(dx1, dy2, dz2, dx1, dy2, dz1, color);
+
+        // Vertical edges
+        event.line(dx1, dy1, dz1, dx1, dy2, dz1, color);
+        event.line(dx2, dy1, dz1, dx2, dy2, dz1, color);
+        event.line(dx2, dy1, dz2, dx2, dy2, dz2, color);
+        event.line(dx1, dy1, dz2, dx1, dy2, dz2, color);
     }
-    
-    // ==================== CONFIG GETTERS / SETTERS ====================
-    
-    public boolean isEnabled() { return enabled; }
-    public void setEnabled(boolean enabled) { this.enabled = enabled; }
-    
-    public boolean isDetectAmethyst() { return detectAmethyst; }
-    public void setDetectAmethyst(boolean detect) { this.detectAmethyst = detect; }
-    
-    public boolean isDetectKelp() { return detectKelp; }
-    public void setDetectKelp(boolean detect) { this.detectKelp = detect; }
-    
-    public boolean isDetectBamboo() { return detectBamboo; }
-    public void setDetectBamboo(boolean detect) { this.detectBamboo = detect; }
-    
-    public boolean isDetectVines() { return detectVines; }
-    public void setDetectVines(boolean detect) { this.detectVines = detect; }
-    
-    public boolean isDetectGrowthBlocks() { return detectGrowthBlocks; }
-    public void setDetectGrowthBlocks(boolean detect) { this.detectGrowthBlocks = detect; }
-    
-    public boolean isDetectStructuralBlocks() { return detectStructuralBlocks; }
-    public void setDetectStructuralBlocks(boolean detect) { this.detectStructuralBlocks = detect; }
-    
-    public boolean isClearCacheOnRelog() { return clearCacheOnRelog; }
-    public void setClearCacheOnRelog(boolean clear) { this.clearCacheOnRelog = clear; }
-    
-    public boolean isProcessUnloadEvents() { return processUnloadEvents; }
-    public void setProcessUnloadEvents(boolean process) { this.processUnloadEvents = process; }
-    
-    public HighlightStyle getHighlightStyle() { return highlightStyle; }
-    public void setHighlightStyle(HighlightStyle style) { this.highlightStyle = style; }
-    
-    public int getSusChunkColor() { return susChunkColor; }
-    public void setSusChunkColor(int color) { this.susChunkColor = color; }
-    
-    public float getColorAlpha() { return colorAlpha; }
-    public void setColorAlpha(float alpha) { this.colorAlpha = Math.max(0.0f, Math.min(1.0f, alpha)); }
-    
-    public boolean isShowDistanceIndicator() { return showDistanceIndicator; }
-    public void setShowDistanceIndicator(boolean show) { this.showDistanceIndicator = show; }
+
+    private void renderFilled(Render3DEvent event, int x1, int z1, int x2, int z2, int y1, int y2, Vec3d cam, Color color) {
+        double dx1 = x1 - cam.x;
+        double dz1 = z1 - cam.z;
+        double dx2 = x2 - cam.x;
+        double dz2 = z2 - cam.z;
+        double dy1 = y1 - cam.y;
+        double dy2 = y2 - cam.y;
+
+        // Bottom, Top, Front, Back, Left, Right
+        event.quad(dx1, dy1, dz1, dx2, dy1, dz1, dx2, dy1, dz2, dx1, dy1, dz2, color);
+        event.quad(dx1, dy2, dz1, dx2, dy2, dz1, dx2, dy2, dz2, dx1, dy2, dz2, color);
+        event.quad(dx1, dy1, dz1, dx2, dy1, dz1, dx2, dy2, dz1, dx1, dy2, dz1, color);
+        event.quad(dx1, dy1, dz2, dx2, dy1, dz2, dx2, dy2, dz2, dx1, dy2, dz2, color);
+        event.quad(dx1, dy1, dz1, dx1, dy1, dz2, dx1, dy2, dz2, dx1, dy2, dz1, color);
+        event.quad(dx2, dy1, dz1, dx2, dy1, dz2, dx2, dy2, dz2, dx2, dy2, dz1, color);
+    }
+
+    private void renderDistanceLabel() {
+        if (closestSusChunk == null || mc.player == null) return;
+
+        String text = String.format("Closest Sus: X:%d Z:%d [%.1fm]", 
+            closestSusChunk.getCenterBlockX(), closestSusChunk.getCenterBlockZ(), closestDistance);
+        
+        int screenWidth = mc.getWindow().getScaledWidth();
+        int x = screenWidth / 2 - mc.textRenderer.getWidth(text) / 2;
+        int y = 30;
+
+        mc.textRenderer.drawWithBackground(text, x, y, 0x00FF00, 0);
+    }
+
+    public Set<ChunkPos> getSuspiciousChunks() {
+        return new HashSet<>(suspiciousChunks);
+    }
+
+    public Map<ChunkPos, List<String>> getChunkReasons() {
+        return new HashMap<>(chunkReasons);
+    }
 }
