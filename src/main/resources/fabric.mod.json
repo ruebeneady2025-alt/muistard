@@ -1,0 +1,15 @@
+{
+  "schemaVersion": 1,
+  "id": "mustard",
+  "version": "${version}",
+  "name": "Mustard",
+  "description": "Mustard Fabric client add-on",
+  "authors": ["Mustard"],
+  "license": "MIT",
+  "environment": "*",
+  "depends": {
+    "fabricloader": ">=0.15.11",
+    "minecraft": ">=1.20.1",
+    "java": ">=17"
+  }
+}
